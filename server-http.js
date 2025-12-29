@@ -52,14 +52,27 @@ app.use(express.json({ limit: '5mb' }));
 
 const auth = (req, res, next) => {
     const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || req.query.apiKey;
-    if (!API_KEY) return res.status(503).json({ error: 'MCP_API_KEY not configured' });
-    if (!key) return res.status(403).json({ error: 'API key required' });
+    if (!API_KEY) {
+        console.error('Auth Error: MCP_API_KEY not configured on server');
+        return res.status(503).json({ error: 'MCP_API_KEY not configured' });
+    }
+    if (!key) {
+        console.error('Auth Error: No key provided in request');
+        return res.status(403).json({ error: 'API key required' });
+    }
 
     // timingSafeEqual requires same length buffers
     const keyBuf = Buffer.from(key);
     const apiBuf = Buffer.from(API_KEY);
-    if (keyBuf.length !== apiBuf.length || !crypto.timingSafeEqual(keyBuf, apiBuf)) {
-        return res.status(403).json({ error: 'Invalid API key' });
+
+    if (keyBuf.length !== apiBuf.length) {
+        console.error(`Auth Error: Key length mismatch. Received: ${keyBuf.length}, Expected: ${apiBuf.length}`);
+        return res.status(403).json({ error: 'Invalid API key (length check)' });
+    }
+
+    if (!crypto.timingSafeEqual(keyBuf, apiBuf)) {
+        console.error('Auth Error: Key content mismatch');
+        return res.status(403).json({ error: 'Invalid API key (content check)' });
     }
     next();
 };
