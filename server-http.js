@@ -278,6 +278,67 @@ app.post('/tools/:tool', auth, async (req, res) => {
     }
 });
 
+// ============================================
+// Streamable HTTP Transport (MCP Powers Compatible)
+// Single endpoint for both SSE and JSON-RPC
+// ============================================
+
+// GET /mcp - SSE stream for server-to-client messages
+app.get('/mcp', auth, (req, res) => {
+    const dbUrl = req.headers['x-database-url'] || req.query.databaseUrl;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const id = crypto.randomUUID();
+    sseConnections.set(id, { res, dbUrl });
+
+    // Send endpoint info for client to POST to
+    res.write(`event: endpoint\ndata: ${JSON.stringify({ endpoint: `/mcp?sessionId=${id}` })}\n\n`);
+
+    const ping = setInterval(() => res.write(`event: ping\ndata: ${Date.now()}\n\n`), 30000);
+    req.on('close', () => { clearInterval(ping); sseConnections.delete(id); });
+});
+
+// POST /mcp - JSON-RPC messages from client
+app.post('/mcp', auth, async (req, res) => {
+    const { method, params, id } = req.body;
+    const sessionId = req.query.sessionId;
+    const dbUrl = req.headers['x-database-url'] || req.body.databaseUrl || sseConnections.get(sessionId)?.dbUrl;
+
+    try {
+        let result;
+        switch (method) {
+            case 'initialize':
+                result = {
+                    protocolVersion: '2024-11-05',
+                    capabilities: { tools: {} },
+                    serverInfo: { name: 'postgres-mcp-server', version: '2.0.0' }
+                };
+                break;
+            case 'tools/list':
+                result = { tools: MCP_TOOLS };
+                break;
+            case 'tools/call':
+                if (!validUrl(dbUrl)) throw new Error('DATABASE_URL required via X-Database-URL header');
+                const toolResult = await executeTool(dbUrl, params.name, params.arguments || {});
+                result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
+                break;
+            case 'notifications/initialized':
+                result = {};
+                break;
+            default:
+                throw new Error(`Unknown method: ${method}`);
+        }
+
+        res.json({ jsonrpc: '2.0', id, result });
+    } catch (e) {
+        res.status(200).json({ jsonrpc: '2.0', id, error: { code: -32603, message: e.message } });
+    }
+});
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 app.listen(PORT, () => console.log(`
