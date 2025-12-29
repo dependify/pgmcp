@@ -308,23 +308,46 @@ app.get('/mcp', auth, (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable buffering for Nginx/Coolify
     res.flushHeaders();
 
     const id = crypto.randomUUID();
     sseConnections.set(id, { res, dbUrl });
 
+    console.log(`[MCP] SSE Connected. Session: ${id}`);
+
     // Send endpoint info for client to POST to
     res.write(`event: endpoint\ndata: ${JSON.stringify({ endpoint: `/mcp?sessionId=${id}` })}\n\n`);
 
-    const ping = setInterval(() => res.write(`event: ping\ndata: ${Date.now()}\n\n`), 30000);
-    req.on('close', () => { clearInterval(ping); sseConnections.delete(id); });
+    // Initial ping to ensure connection is alive
+    res.write(`event: ping\ndata: {}\n\n`);
+
+    const ping = setInterval(() => res.write(`event: ping\ndata: {}\n\n`), 15000); // 15s ping
+    req.on('close', () => {
+        console.log(`[MCP] SSE Closed. Session: ${id}`);
+        clearInterval(ping);
+        sseConnections.delete(id);
+    });
 });
 
 // POST /mcp - JSON-RPC messages from client
 app.post('/mcp', auth, async (req, res) => {
     const { method, params, id } = req.body;
     const sessionId = req.query.sessionId;
+
+    // Debug log
+    console.log(`[MCP] POST received. Method: ${method}, Session: ${sessionId}`);
+
     const dbUrl = req.headers['x-database-url'] || req.body.databaseUrl || sseConnections.get(sessionId)?.dbUrl;
+
+    // Use sessionId as connectionId since that's how we issued it
+    const conn = sseConnections.get(sessionId);
+
+    if (!conn) {
+        console.error(`[MCP] Connection not found for session: ${sessionId}`);
+        // If we don't have an SSE connection, we can't really send a response the way MCP expects
+        // but we'll try to return it via HTTP just in case the client accepts that as fallback
+    }
 
     try {
         let result;
@@ -345,15 +368,31 @@ app.post('/mcp', auth, async (req, res) => {
                 result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
                 break;
             case 'notifications/initialized':
-                result = {};
-                break;
+                // Just an acknowledgement
+                console.log('[MCP] Client initialized');
+                if (conn) conn.res.write(`event: response\n\n`); // Keep alive
+                return res.json({ status: 'ok' });
             default:
                 throw new Error(`Unknown method: ${method}`);
         }
 
-        res.json({ jsonrpc: '2.0', id, result });
+        const response = { jsonrpc: '2.0', id, result };
+
+        // CRITICAL: Send response via SSE
+        if (conn) {
+            console.log('[MCP] Sending response via SSE');
+            conn.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+        } else {
+            console.warn('[MCP] No SSE connection, sending response via HTTP only');
+        }
+
+        // Also return via HTTP for compatibility (some clients use this)
+        res.json(response);
     } catch (e) {
-        res.status(200).json({ jsonrpc: '2.0', id, error: { code: -32603, message: e.message } });
+        console.error(`[MCP] Error: ${e.message}`);
+        const errorResponse = { jsonrpc: '2.0', id, error: { code: -32603, message: e.message } };
+        if (conn) conn.res.write(`event: message\ndata: ${JSON.stringify(errorResponse)}\n\n`);
+        res.json(errorResponse);
     }
 });
 
